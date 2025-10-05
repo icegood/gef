@@ -87,8 +87,10 @@ import xmlrpc.client as xmlrpclib #pylint: disable=import-error
 from html.parser import HTMLParser #pylint: disable=import-error
 from io import StringIO
 from urllib.request import urlopen #pylint: disable=import-error,no-name-in-module
+from bisect import bisect_right
 
 lru_cache = functools.lru_cache #pylint: disable=no-member
+total_ordering = functools.total_ordering #pylint: disable=no-member
 
 LEFT_ARROW = " \u2190 "
 RIGHT_ARROW = " \u2192 "
@@ -918,7 +920,8 @@ class GlibcChunk:
         return "|".join(flags)
 
     def __str__(self):
-        msg = "{:s}(addr={:#x}, size={:#x}, flags={:s})".format(Color.colorify("Chunk", "yellow bold underline"),
+        msg = "{:s}(base addr={:#x}, user addr={:#x}, size={:#x}, flags={:s})".format(Color.colorify("Chunk", "yellow bold underline"),
+                                                                int(self.chunk_base_address),
                                                                 int(self.address),
                                                                 self.get_chunk_size(),
                                                                 self.flags_as_string())
@@ -2405,7 +2408,11 @@ def read_memory(addr, length=0x10):
 def read_int_from_memory(addr):
     """Return an integer read from memory."""
     sz = current_arch.ptrsize
-    mem = read_memory(addr, sz)
+    try:
+      mem = read_memory(addr, sz)
+    except:
+      err("Cannot read {0:d} ({0:#x})".format(addr))
+      return 0
     unpack = u32 if sz==4 else u64
     return unpack(mem)
 
@@ -2842,6 +2849,136 @@ def get_info_files():
 
     return __infos_files__
 
+@total_ordering
+class InfoFileGroup:
+    """GEF representation of grouped info files by non-intersected adresses."""
+    zones = []
+    addressFrom = -1
+    addressTo = -1
+    label = ""
+
+    def __init__(self, zone):
+        if zone is not None:
+            self.CreateFromZone(zone)
+        return
+    
+    @classmethod
+    def fromAdresses(cls, addressFrom, addressTo):
+        instance = cls(None)
+        instance.addressFrom = addressFrom
+        instance.addressTo = addressTo
+        return instance
+
+    def __lt__(self, other):
+        if isinstance(other, InfoFileGroup):
+            return self.addressTo <= other.addressFrom
+        else:
+            return False
+
+    def __eq__(self, other):
+        if isinstance(other, InfoFileGroup):
+            return (self.addressFrom < other.addressTo) and (self.addressTo > other.addressFrom)
+        else:
+            return False
+
+    def CreateFromZone(self, zone):
+        self.zones = [zone]
+        self.addressFrom = zone.zone_start
+        self.addressTo = zone.zone_end
+
+    def MergeFileGroup(self, fileGroup):
+        for zone in fileGroup.zones:
+            if (zone.zone_start < self.addressFrom) or (self.addressFrom == -1):
+                self.addressFrom = zone.zone_start
+            if zone.zone_end > self.addressTo:
+                self.addressTo = zone.zone_end
+            self.zones.append(zone)
+
+    def GetLabel(self):
+        if self.label == "":
+          return "(empty)"
+        return self.label
+
+    def SetLabel(self, label):
+        self.label = label
+      
+    def SortZones(self):
+          self.zones.sort(key=lambda x:x.zone_start)
+
+@lru_cache()
+def ice_get_info_file_zones():
+    zones = []
+    fileTypeProcessed = ""
+    fileProcessed = ""
+    fileName = ""
+    fileType = ""
+    lines = gdb.execute("info files", to_string=True).splitlines()
+    reFileType = re.compile("Local (.*) file:")
+    reFileName = re.compile("\t.*/(.*)\', file type .*")
+    reSection = re.compile("\t(0x[0-9a-f]+) - (0x[0-9a-f]+) is (.*)")
+    reLibInSection = re.compile("(.*) in .*/(.*)")
+    for line in lines:
+        if (fileTypeProcessed == ""):
+            match = reFileType.fullmatch(line)
+            if match:
+                fileTypeProcessed = match.group(1)
+                continue
+        if (fileTypeProcessed != ""):
+            match = reFileName.fullmatch(line)
+            if match:
+                fileType = fileTypeProcessed
+                fileName =  match.group(1)
+            fileTypeProcessed = ""
+            continue
+        #
+        match = reSection.fullmatch(line)
+        if match:
+            zone_name = match.group(3)
+            zone_fileName = fileName
+            if (fileType != "core dump"):
+                match2 = reLibInSection.fullmatch(match.group(3))
+                if match2:
+                    zone_name = match2.group(1)
+                    zone_fileName = match2.group(2)
+            zone = Zone(zone_name, int(match.group(1), 16), int(match.group(2), 16), zone_fileName)
+            zones.append(zone)
+    return zones
+
+ice_info_file_groups_sorted = None
+ice_info_file_starts = None  # list of start addresses
+
+def ice_get_info_file_groups_sorted():
+    global ice_info_file_groups_sorted, ice_info_file_starts
+    if ice_info_file_groups_sorted is not None:
+        return ice_info_file_groups_sorted, ice_info_file_starts
+
+    zones = ice_get_info_file_zones()
+    groups_dict = {}
+
+    # Merge groups with same start
+    for zone in zones:
+        ifg = InfoFileGroup(zone)
+        start = ifg.addressFrom
+        if start in groups_dict:
+            groups_dict[start].MergeFileGroup(ifg)
+        else:
+            groups_dict[start] = ifg
+
+    # Sort zones inside each group
+    for ifg in groups_dict.values():
+        ifg.SortZones()
+
+    # Sort by start address
+    ice_info_file_groups_sorted = sorted(groups_dict.values(), key=lambda g: g.addressFrom)
+    ice_info_file_starts = [g.addressFrom for g in ice_info_file_groups_sorted]
+
+    return ice_info_file_groups_sorted, ice_info_file_starts
+
+def find_info_file_group(address):
+    """Return the InfoFileGroup containing `address`, or None."""
+    groups, starts = ice_get_info_file_groups_sorted()
+    idx = bisect.bisect_right(starts, address) - 1
+    return groups[idx] if idx >= 0 and groups[idx].addressFrom <= address < groups[idx].addressTo else None
 
 def process_lookup_address(address):
     """Look up for an address in memory.
@@ -5394,8 +5531,12 @@ class SearchPatternCommand(GenericCommand):
             else:
                 chunk_size = step
 
-            mem = read_memory(chunk_addr, chunk_size)
-
+            try:
+                mem = read_memory(chunk_addr, chunk_size)
+            except:
+                err("Cannot read: {:#x}".format(chunk_addr))
+                continue
+            
             for match in re.finditer(pattern, mem):
                 start = chunk_addr + match.start()
                 if is_ascii_string(start):
@@ -6412,7 +6553,7 @@ class GlibcHeapChunkRangeCommand(GenericCommand):
 
     _cmdline_ = "heap chunkrange"
     _syntax_  = "{:s} LOCATION_FROM LOCATION_TO".format(_cmdline_)
-    _example_ = "\n{0:s}\n{0:s} 0x4000aa00 0x4000da00".format(_cmdline_)
+    _example_ = "\n{0:s} 0x4000aa00 0x4000da00".format(_cmdline_)
 
     def __init__(self):
         super(GlibcHeapChunkRangeCommand, self).__init__(complete=gdb.COMPLETE_LOCATION)
@@ -10405,6 +10546,159 @@ class GefTmuxSetup(gdb.Command):
         os.unlink(tty_path)
         return
 
+@register_command
+class FindSymbolsAll(GenericCommand):
+    """Command to find byte sequence in whole virtual memory bypassing non-readable regions."""
+
+    _cmdline_ = "findall"
+    _syntax_  = "{:s} [/SIZE-CHAR] [/MAX-COUNT] EXPR1 [, EXPR2 ...]".format(_cmdline_)
+
+    def __init__(self):
+        super(FindSymbolsAll, self).__init__(prefix=True)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        if argv is None:
+          self.usage()
+          return
+        
+        i = 0
+        for arg in argv:
+            if arg[0] == '/':
+                i += 1
+            else:
+                break
+        
+        opts = argv[:i]
+        argleft = argv[i:]
+
+        sections = get_info_files()
+        for section in sections:
+            if (section.zone_end > section.zone_start):
+                try:
+                  result = gdb.execute("find {} {}, {}, {}".format("".join(opts),
+                    section.zone_start, section.zone_end -1, ",".join(argleft)), to_string = True)
+                except Exception as inst:
+                    err("Cannot find within {:#x}-{:#x}: {}".format(section.zone_start, section.zone_end -1, inst))
+                if (result.find("Pattern not found.") == -1):
+                  text = "{}: {:#x}-{:#x} in {}".format(section.name, section.zone_start, section.zone_end, section.filename)
+                  gef_print(text + "\n" + result)
+        return
+
+@register_command
+class GlibcSectionsCommand(GenericCommand):
+    """Base command to get information about sections."""
+
+    _cmdline_ = "sections"
+    _syntax_  = "{:s} (groups|labels)".format(_cmdline_)
+
+    def __init__(self):
+        super(GlibcSectionsCommand, self).__init__(command = gdb.COMMAND_DATA, complete=gdb.COMPLETE_COMMAND, prefix=True)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        self.usage()
+        return
+
+# @register_command
+# class PrintInfoFileZones(GenericCommand):
+#     """Command to print all info files."""
+# 
+#     _cmdline_ = "sections files"
+#     _syntax_  = "{:s}".format(_cmdline_)
+# 
+#     def __init__(self):
+#         super(PrintInfoFileZones, self).__init__()
+#         return
+# 
+#     @only_if_gdb_running
+#     def do_invoke(self, argv):
+#         zones = ice_get_info_file_zones()
+#         for zone in zones:
+#             gef_print("{}/{}: {:#x}-{:#x}".format(zone.filename, zone.name, zone.zone_start, zone.zone_end))
+
+@register_command
+class PrintInfoFileGroups(GenericCommand):
+    """Command to print all info files grouped by different sources in non-intersect intervals."""
+
+    _cmdline_ = "sections groups"
+    _syntax_  = "{:s} [/lo] [/ne] [address]".format(_cmdline_)
+
+    def __init__(self):
+        super(PrintInfoFileGroups, self).__init__(complete=gdb.COMPLETE_LOCATION)
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        printEmpty = True
+        printLabeledOnly = False
+        address = -1
+
+        for arg in argv:
+            if arg == '/ne':
+                printEmpty = False
+            elif arg == '/lo':
+                printLabeledOnly = True
+            else:
+                address = int(arg, 16)
+
+        groups, starts = ice_get_info_file_groups_sorted()
+
+        if address == -1:
+            # Print all groups
+            to_print = groups
+        else:
+            # Find single group containing address
+            ifg = find_info_file_group(address)
+            if ifg:
+                to_print = [ifg]
+            else:
+                err(f"No InfoFileGroup found containing address {address:#x}")
+                return
+
+        for ifg in to_print:
+            if not printEmpty and ifg.addressFrom == ifg.addressTo:
+                continue
+            if printLabeledOnly and ifg.label == "":
+                continue
+
+            gef_print(Color.colorify(
+                "{}: {:#x}-{:#x}".format(ifg.GetLabel(), ifg.addressFrom, ifg.addressTo),
+                "green"
+            ))
+
+            for zone in ifg.zones:
+                gef_print(
+                    "\t{}/{}: {:#x}-{:#x}".format(zone.filename, zone.name, zone.zone_start, zone.zone_end)
+                )
+
+@register_command
+class SetInfoFileGroupsLabel(GenericCommand):
+    """Command to set label for a section group."""
+
+    _cmdline_ = "sections labels"
+    _syntax_  = "{:s} address label".format(_cmdline_)
+
+    def __init__(self):
+        super(SetInfoFileGroupsLabel, self).__init__(complete=gdb.COMPLETE_LOCATION)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        if len(argv) != 2:
+            err("Missing address and label")
+            self.usage()
+            return
+
+        address = int(argv[0], 16)
+        label = argv[1]
+
+        ifg = find_info_file_group(address)
+        if ifg:
+            ifg.SetLabel(label)
+        else:
+            err(f"No InfoFileGroup found containing address {address:#x}")
 
 def __gef_prompt__(current_prompt):
     """GEF custom prompt function."""
@@ -10412,7 +10706,6 @@ def __gef_prompt__(current_prompt):
     if get_gef_setting("gef.disable_color") is True: return GEF_PROMPT
     if is_alive(): return GEF_PROMPT_ON
     return GEF_PROMPT_OFF
-
 
 if __name__  == "__main__":
 
